@@ -125,6 +125,8 @@ class InterviewWSSession:
         self.interview = None
         self.questions = []
         self.deepgram: DeepgramLiveClient | None = None
+        self._connected = True
+        self._disconnect_event = asyncio.Event()
 
         # ── TTS ──
         self._tts: DeepgramTTSClient | None = None
@@ -285,6 +287,9 @@ class InterviewWSSession:
     async def _on_transcript(self, result: TranscriptResult) -> None:
         """Called by DeepgramLiveClient for each transcript result."""
 
+        if not self._connected:
+            return
+
         # Ignore transcripts while AI is speaking
         if self._state in (InterviewState.INTERRUPTING, InterviewState.AI_SPEAKING):
             return
@@ -322,6 +327,9 @@ class InterviewWSSession:
         Callback from DeepgramTTSClient — each audio frame is forwarded
         to the client as a base64-encoded tts_audio message.
         """
+
+        if not self._connected:
+            return
         b64 = base64.b64encode(audio_bytes).decode("ascii")
         await self._send_json({
             "type": "tts_audio",
@@ -429,8 +437,11 @@ class InterviewWSSession:
         should interrupt the candidate mid-answer.
         """
         try:
-            while True:
+            while self._connected:
                 await asyncio.sleep(ANALYSIS_INTERVAL_S)
+
+                if not self._connected:
+                    break
 
                 # Only analyze while waiting for an answer
                 if self._state != InterviewState.WAITING_FOR_ANSWER:
@@ -697,10 +708,15 @@ Return JSON scores then a brief transition."""
 
     async def _send_json(self, data: dict) -> None:
         """Send a JSON message to the WebSocket client."""
+        if not self._connected:
+            return
+
         try:
             await self.ws.send_json(data)
         except Exception as e:
-            logger.warning(f"Failed to send WS message: {e}")
+            logger.warning(f"WebSocket send failed, marking disconnected: {e}")
+            self._connected = False
+            self._disconnect_event.set()
 
     async def _send_error(self, message: str) -> None:
         """Send an error message to the client."""
@@ -713,15 +729,6 @@ Return JSON scores then a brief transition."""
 
 @router.websocket("/ws/interview/{session_id}")
 async def interview_websocket(ws: WebSocket, session_id: str):
-    """
-    Real-time interview WebSocket endpoint with mid-answer interruption
-    and AI voice output via Deepgram TTS.
-
-    1. Client streams audio → Deepgram STT transcribes
-    2. Every 3s, partial transcript analyzed for interruption
-    3. On utterance end → LLM evaluates → tokens sentence-buffered → TTS → audio pushed
-    4. Next question pushed → loop until interview complete
-    """
     await ws.accept()
     logger.info(f"WS connected: session={session_id}")
 
@@ -729,47 +736,40 @@ async def interview_websocket(ws: WebSocket, session_id: str):
     processing_task: asyncio.Task | None = None
 
     try:
-        # Load interview from DB
         if not await session.initialize():
             await ws.close(code=4000, reason="Invalid session")
             return
 
-        # Open Deepgram STT + TTS connections
         await session.start_deepgram()
         await session.start_tts()
 
-        # Start background tasks
         processing_task = asyncio.create_task(_answer_loop(session))
         session.start_analysis_loop()
 
-        # Main loop: receive client messages
-        try:
-            while True:
-                raw = await ws.receive_text()
-                msg = json.loads(raw)
-                msg_type = msg.get("type", "")
+        while True:
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+            msg_type = msg.get("type", "")
 
-                if msg_type == "audio_chunk":
-                    await session.handle_audio_chunk(msg.get("data", ""))
+            if msg_type == "audio_chunk":
+                await session.handle_audio_chunk(msg.get("data", ""))
 
-                elif msg_type == "end_utterance":
-                    await session.handle_end_utterance()
+            elif msg_type == "end_utterance":
+                await session.handle_end_utterance()
 
-                else:
-                    logger.debug(f"Unknown WS message type: {msg_type}")
-
-        except WebSocketDisconnect:
-            logger.info(f"WS disconnected: session={session_id}")
+    except WebSocketDisconnect:
+        logger.info(f"WS disconnected: session={session_id}")
 
     except Exception as e:
         logger.error(f"WS error for session {session_id}: {e}")
-        try:
+        if session._connected:
             await session._send_error(f"Server error: {e}")
-        except Exception:
-            pass
+
     finally:
-        # Cancel processing loop
-        if processing_task is not None:
+        session._connected = False
+        session._disconnect_event.set()
+
+        if processing_task:
             processing_task.cancel()
             try:
                 await processing_task
@@ -777,7 +777,8 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                 pass
 
         await session.cleanup()
-        logger.info(f"WS session {session_id} ended")
+
+        logger.info(f"WS session {session_id} fully terminated")
 
 
 async def _answer_loop(session: InterviewWSSession) -> None:
@@ -786,12 +787,14 @@ async def _answer_loop(session: InterviewWSSession) -> None:
     Runs until interview is complete or cancelled.
     """
     try:
-        while True:
+        while session._connected:
             should_continue = await session.wait_and_process_answer()
             if not should_continue:
                 break
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        logger.error(f"Answer processing loop error: {e}")
-        await session._send_error(f"Processing error: {e}")
+        if session._connected:
+            logger.error(f"Answer processing loop error: {e}")
+            await session._send_error(f"Processing error: {e}")
+
